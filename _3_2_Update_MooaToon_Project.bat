@@ -10,6 +10,7 @@ call _2_5_Settings.bat
 pushd %projectFolderName%
 
 git pull origin %projectBranchName% --depth=100
+git submodule update --init --recursive
 
 popd
 

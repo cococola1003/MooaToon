@@ -7,6 +7,10 @@ import github3 as gh
 from dotenv import load_dotenv
 import winreg
 import locale
+import threading
+import time
+import requests
+from concurrent.futures import ThreadPoolExecutor
 
 
 # Inputs: MooaRootDir engineBranchName projectBranchName [--Clean --BuildEngine --ZipEngine --ZipProject --Release --Reupload]
@@ -14,21 +18,22 @@ import locale
 # ================= Defines =================
 repo_name = "JasonMa0012/MooaToon"
 
-mooatoon_root_path = r"X:\MooaToon"
+mooatoon_root_path = r"E:\MooaRel"
 if len(sys.argv) > 1:
     mooatoon_root_path = sys.argv[1]
 
-engine_version = "5.5"
+engine_version = "5.6"
 if len(sys.argv) > 2:
     engine_version = sys.argv[2]
 
-project_branch_name = "5.5_MooaToonProject"
+project_branch_name = "5.6_MooaToonProject"
 if len(sys.argv) > 3:
     project_branch_name = sys.argv[3]
 
 # Default Input
 argv = [
-    '--Reupload'
+    '--Release'
+    # '--Reupload'
 ]
 if len(sys.argv) > 4:
     argv = sys.argv[4:]
@@ -87,6 +92,68 @@ def async_run(args):
     return process.poll()
 
 
+def upload_single_asset(repo_name, tag_name, file_path, lock):
+    """上传单个文件的线程函数，失败时无限重试"""
+    file_name = os.path.basename(file_path)
+    retry_count = 0
+    
+    with lock:
+        print(f"开始上传: {file_name}")
+    
+    while True:
+        try:
+            ghr.gh_asset_upload(repo_name, tag_name, [file_path])
+            
+            with lock:
+                if retry_count > 0:
+                    print(f"上传成功: {file_name} (重试 {retry_count} 次后成功)")
+                else:
+                    print(f"上传成功: {file_name}")
+            return True
+            
+        except Exception as e:
+            retry_count += 1
+            with lock:
+                print(f"上传失败: {file_name}, 错误: {str(e)}")
+                print(f"第 {retry_count} 次重试中... (3秒后重试)")
+            
+            # 等待3秒后重试
+            time.sleep(3)
+
+
+def multithread_upload(repo_name, tag_name, file_paths):
+    """多线程上传文件，每个文件都会重试直到成功"""
+    if not file_paths:
+        print("没有文件需要上传")
+        return True
+    
+    # 计算并发线程数：文件总数的1/3，但至少1个
+    max_workers = max(1, len(file_paths) // 3)
+    
+    print(f"开始多线程上传 {len(file_paths)} 个文件...")
+    print(f"同时上传文件数量: {max_workers} (文件总数的1/3)")
+    print("注意: 每个文件都会重试直到上传成功")
+    
+    lock = threading.Lock()
+    
+    # 使用线程池控制并发数量
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # 提交所有上传任务
+        futures = []
+        for file_path in file_paths:
+            future = executor.submit(upload_single_asset, repo_name, tag_name, file_path, lock)
+            futures.append(future)
+        
+        # 等待所有任务完成
+        for future in futures:
+            future.result()  # 这会等待任务完成，如果有异常会抛出
+    
+    with lock:
+        print(f"所有文件上传完成: {len(file_paths)} 个文件全部上传成功")
+    
+    return True  # 现在总是返回True，因为会无限重试直到成功
+
+
 # ================= Main ==================
 load_dotenv(dotenv_path=get_onedrive_env_path())
 
@@ -139,27 +206,70 @@ if '--Release' in argv:
     else:
         comment = get_release_comment(engine_version, last_release_info['published_at'][0:10])
         comment += get_release_comment(project_branch_name, last_release_info['published_at'][0:10])
-    ghr.gh_release_create(
-        repo_name,
-        release_name,
-        publish=False,
-        body=comment,
-        name=release_name,
-        asset_pattern=file_paths,
-    )
-    ghr.gh_release_publish(repo_name, release_name)
+
+    # Compose compare link (English) and enforce GitHub body length limit (125000)
+    MAX_BODY = 100000
+    compare_section = ""
+    if last_release_info is not None:
+        prev_tag = last_release_info['tag_name']
+        compare_url = f"https://github.com/{repo_name}/compare/{prev_tag}...{release_name}"
+        compare_section = f"\n\n**Full Changelog**:\n{compare_url}\n"
+    else:
+        compare_section = ""
+
+    if comment is None:
+        comment = ""
+
+    # Ensure the final body keeps the compare link while respecting the max length
+    reserved = len(compare_section)
+    if len(comment) + reserved > MAX_BODY:
+        notice = "\n\n(Commit list truncated due to length limit)\n"
+        allowed = MAX_BODY - reserved - len(notice)
+        if allowed < 0:
+            allowed = 0
+        comment = comment[:allowed] + notice
+
+    final_body = comment + compare_section
+
+    try:
+        ghr.gh_release_create(
+            repo_name,
+            release_name,
+            publish=False,
+            body=final_body,
+            name=release_name,
+        )
+    except Exception as e:
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            print("Create release failed:", e.response.status_code, e.response.reason)
+            try:
+                print("Details:", e.response.json())
+            except Exception:
+                print("Raw:", e.response.text[:1000])
+        raise
+
+    # 使用多线程上传
+    upload_success = multithread_upload(repo_name, release_name, file_paths)
+    if upload_success:
+        ghr.gh_release_publish(repo_name, release_name)
+    else:
+        print("部分文件上传失败，请检查后重试")
 
 if '--Reupload' in argv:
     print("======Reupload======")
     if last_draft_info is not None:
         # 仅上传失败的文件
         for asset in last_draft_info['assets']:
-            for file_path in file_paths:
+            for file_path in file_paths[:]:  # 使用副本避免在迭代时修改列表
                 if file_path.endswith(asset['name']):
                     file_paths.remove(file_path)
 
-        ghr.gh_asset_upload(repo_name, last_draft_info['tag_name'], file_paths)
-        ghr.gh_release_publish(repo_name, last_draft_info['tag_name'])
+        # 使用多线程上传
+        upload_success = multithread_upload(repo_name, last_draft_info['tag_name'], file_paths)
+        if upload_success:
+            ghr.gh_release_publish(repo_name, last_draft_info['tag_name'])
+        else:
+            print("部分文件上传失败，请检查后重试")
     else:
         print("\nThere is no draft!\n")
 
